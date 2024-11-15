@@ -23,7 +23,7 @@ Syntax highlighted code block
 
 **Bold** and _Italic_ and `Code` text
 
-[files/DoğaErçin_HW1.Rmd](url) and ![Image](src)
+[fall-24-doaercin/DoğaErçin_HW1.Rmd](url) and ![Image](src)
 ```
 
 For more details see [GitHub Flavored Markdown](https://guides.github.com/features/mastering-markdown/).
