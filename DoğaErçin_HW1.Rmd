@@ -1,0 +1,441 @@
+---
+editor_options: 
+  markdown: 
+    wrap: 150
+---
+
+IE 582 : Statistical Learning for Data Mining
+
+Homework 1
+
+Prof. Mustafa Gökçe Baydoğan
+
+Doğa Erçin
+
+2021402000
+
+The goal of this project is to improve the design process for high-frequency antennas, especially those needed for 5G technology, which are used in
+communication systems. Achieving effective antenna performance across particular frequency bands is crucial, but predicting important characteristics,
+like the S11 parameter, which shows radiation efficiency and return loss, requires computationally expensive traditional electromagnetic simulations.
+Machine learning techniques have gained popularity as a way to model the intricate relationship between antenna geometry and the S-parameters,
+potentially reducing computation time and resource requirements, given the extensive trial and error frequently needed to optimize antenna design.
+
+In order to analyse the real and imaginary components of S11, this project uses simulation data from 385 antenna frequencies that were recorded in the
+23–33 GHz frequency range. We investigate how machine learning can simplify and uncover underlying patterns in the antenna design by using techniques
+like dimensionality reduction (PCA) and supervised learning.
+
+read files
+
+```{r}
+input <- read.csv("hw1_input.csv")
+img <- read.csv("hw1_img.csv")
+real <- read.csv("hw1_real.csv")
+```
+
+In order to perform a good analysis, we first need to clean and arrange the data so that we can use it in the training of our model. For the sake of
+simplicity, I will analyse the relationships of real and imaginary parts of the electromagnetic results seperately.
+
+Clean the training data check if there are any missing values
+
+```{r}
+colSums(is.na(input))
+colSums(is.na(img))
+colSums(is.na(real))
+```
+
+Check if all variables are in range if not, replace them with an appropriate value, or discard the row completely
+
+For columns with values out of range, replacement is done based on the column’s variance. If the variance is low (less than 0.3), the mean is used;
+otherwise, the median is chosen as the replacement value.
+
+```{r}
+ranges <- matrix(c(1.8,5.2,1.8,5.2,0.01,0.04,0.1,0.8,0.02,0.1,0.015,0.05,0,0.025,0.025,0.1,0.05,0.45,2,5,2,5),nrow=11,ncol=2,byrow=TRUE)
+
+#discard the row if 3+ columns are out of range
+out_of_range_count <- apply(input, 1, function(row) {
+  sum(sapply(1:length(row), function(i) {
+    row[i] < ranges[i, 1] || row[i] > ranges[i, 2]
+  }))
+})
+input_cleaned <- input[out_of_range_count < 4, ]
+cat("Number of rows removed:", nrow(input) - nrow(input_cleaned), "\n")
+```
+
+Due to the nature of the features, any values that are out of the given range should not be accepted! So, before an IQR analysis, I completely
+disregard out of range values and replace them with appropriate values. If the feature variance is small enough, I replace the outliers with the
+column mean; and if not, I replace it with the median to not be affected by the outliers. After that, I perform an IQR analysis and do the same
+replacement
+
+```{r}
+changes_per_column <- rep(0,ncol(input_cleaned))
+changes_per_column_iqr <- rep(0,ncol(input_cleaned))
+
+for (i in 1:ncol(input_cleaned)) {
+  min_val <- ranges[i, 1]
+  max_val <- ranges[i, 2]
+    col_var <- var(input_cleaned[[i]])
+    if (col_var < 0.3){
+      replacement <- mean(input_cleaned[[i]], na.rm = TRUE)
+    }else{
+      replacement <- median(input_cleaned[[i]], na.rm = TRUE)
+    }
+    
+  # Replace values outside the range with the replacement
+  out_of_range <- input_cleaned[[i]] < min_val | input_cleaned[[i]] > max_val
+  changes_per_column[i] <- sum(out_of_range)
+  input_cleaned[[i]][out_of_range] <- replacement
+  
+  iqr<- IQR(input_cleaned[,i])*(1.5)
+  lower <-quantile(input_cleaned[,i], prob=0.25)
+  upper <- quantile(input_cleaned[,i], prob=0.75)
+  out_of_range_iqr <- input_cleaned[[i]] < lower-iqr | input_cleaned[[i]] > upper+iqr
+  changes_per_column_iqr[i] <- sum(out_of_range_iqr)
+  input_cleaned[[i]][out_of_range_iqr] <- replacement
+}
+
+in_range <- sapply(1:ncol(input_cleaned), function(i) {
+  min_val <- ranges[i, 1]
+  max_val <- ranges[i, 2]
+all(input_cleaned[[i]] >= min_val & input_cleaned[[i]] <= max_val)
+})
+
+if (all(in_range)) {
+  cat("All out-of-range values have been replaced with the replacement.\n")
+  print(changes_per_column)
+  print(changes_per_column_iqr)
+} else {
+  cat("Some parameters still have values outside their ranges.\n")
+  print(changes_per_column)
+  print(which(!in_range))
+}
+```
+
+Then I check the correlation between variables to have a better understanding about the relationships between the variables. I obtain a 11x11 matrix
+which has pairwise covariance values.It seems, that the strongest relation is between the width of patch and height of substrate, close to %92 and
+positively correlated.
+
+```{r}
+cor(input)
+```
+
+Dimensionality Reduction with PCA We want to make sure the data is scaled before we can do a PCA analysis:
+
+```{r}
+input_scaled <- scale(input_cleaned)
+pca_result <- princomp(input_scaled, cor=T)
+summary(pca_result,loadings=T)
+```
+
+As seen from the cumulative proportion data, we may reduce the dimensions up to the point at which we preserve at approximately 85% of the variance in
+data. In this case, we can choose to have 8 components.
+
+The strong correlation we drew from the correlations matrix is visible in the component equations here. The coefficients of width of patch and height
+of substrate are the same in the first 8 components, which contains 86% of the variance information.
+
+For instance, the first component of the PCA is as follows: comp1= 0.101x1-0.624x2-0.624x4-0.445x10 This index is positively correlated with the
+length of patch(x1), but negatively correlated with the other variables that exist in the equation.
+
+```{r}
+pca_loadings <- pca_result$loadings
+pca_equations <- pca_loadings[,1:8]
+data_after_pca <- input_scaled %*% pca_equations
+```
+
+The matrix pca_equations store 86.16% of the variance in data information, and our dimension is now reduced to 8 from 11.
+
+-Regression analysis
+
+It would be computationaly very expensive to perform a regression fit for all of the 201 frequencies that are given in the data. Therefore, we have to
+choose some of them to use in our analysis. For example, we could choose the frequencies which differ strongly from the others.
+
+To find them out, I compared the column mean with the mean of the 5 surrounding columns, and if it is significantly different from the neighborhood
+mean, I included that frequency in my analysis.
+
+```{r}
+selected_cols <- c(rep(0,ncol(real)))
+
+for (i in 1:ncol(real)){
+  if (i <=2){
+    ref_mean <- (mean(c(real[[1]],real[[2]],real[[3]],real[[4]],real[[5]])))
+  } else if (i<=199){
+    ref_mean <- mean(c(real[[i-2]],real[[i-1]],real[[i]],real[[i+1]],real[[i+2]]))
+  }else{
+    ref_mean <- mean(c(real[[i-4]],real[[i-3]],real[[i]],real[[i-2]],real[[i-1]]))
+  }
+  
+  m <- mean(real[[i]])
+  if (m > (0.995)*ref_mean | m < (1.005)*ref_mean){
+    selected_cols[i]<-1
+  }else{
+    selected_cols[i]<-0
+  }
+}
+
+n_selected_columns <- sum(selected_cols)
+cat("The number of selected columns are:", n_selected_columns,"\n")
+print(selected_cols)
+
+```
+
+Because the selected columns with this method are accumulated in the lower and higher frequencies, I will add some columns randomly to investigate
+some columns from the middle frequencies as well.
+
+```{r}
+set.seed(123)  
+
+random_positions <- sample(1:201, 2)
+selected_cols[random_positions] <- 1
+selected_cols[2] <- 0
+selected_cols[200] <- 0
+print(selected_cols)
+
+real_new <- real[,selected_cols==1]
+img_new <- img[,selected_cols==1]
+```
+
+We will use these 4 columns for the rest of the analysis. For these 4 columns, I perform linear regressions to train the model.
+
+Linear regression: First, we sepearate the big block of data into two so that we can use it for training and testing purposes seperately.
+
+```{r}
+
+y1_all<-c(real_new[[1]])
+y2_all<-c(real_new[[2]])
+y3_all<-c(real_new[[3]])
+y4_all<-c(real_new[[4]])
+df_all <- as.data.frame(input_cleaned)
+df <- df_all[1:193,]
+df_test <- df_all[193:385,]
+y1_test <- y1_all[193:385]
+y2_test <- y2_all[193:385]
+y3_test <- y3_all[193:385]
+y4_test <- y4_all[193:385]
+y1<-y1_all[1:193]
+y2<-y2_all[1:193]
+y3<-y3_all[1:193]
+y4<-y4_all[1:193]
+
+real_test <- real_new[193:385,]
+img_test <- img_new[193:385,]
+real_new <- real_new[1:193,]
+img_new<- img_new[1:193,]
+
+```
+
+```{r}
+
+regression1 <-lm(y1~., df)
+summary(regression1)
+
+regression2 <-lm(y2~., df)
+summary(regression2)
+
+
+regression3 <-lm(y3~., df)
+summary(regression3)
+
+
+regression4 <-lm(y4~., df)
+summary(regression4)
+```
+
+The R-squared values for all the regressions are around 0.77-0.83, which provides a pretty good approximation. The R-squared values are similar for
+each regression model, with the first one being highest.
+
+```{r}
+plot(regression3)
+
+```
+
+In the Q-Q Residuals plot, a sharp deviation at the tail towards the right is observed. This may indicate potential skewness of the model. The small
+deviation at the left part of the graph is expected, since the distributions are expected to be close to normal and have small deviations at the ends.
+
+The residuals vs. Fitted plot suggests that there is a pattern present. The points on the graph appear to be distributed above and below the graph
+randomly, but are accumulated in the left and right sides of the graph. This may indicate something that the model is missing, we may try adding some
+higher order terms.
+
+#Significance of Components: In the first model, only the components Comp.1, Comp.2, and Comp.6 have statistically significant coefficients. This
+implies that each response variable is most significantly impacted by these factors. Comp.1 has a significant negative impact, as shown by its high
+t-value and significance level (p \< 0.001).
+
+In the third and fourth models, Comp. 4 is statistically significant along with Comp. 1 and Comp. 6. Around 82% of the variance in each response
+variable is explained by the predictors. The residual standard error is 0.2983, and the residuals are primarily centered around zero.
+
+Some components, such as Comp.3, Comp.5, Comp.7, and Comp.8, have high p-values (above 0.05), meaning that they have limited statistical significance.
+
+
+Third regression:
+
+```         
+Residuals:
+     Min       1Q   Median       3Q      Max 
+-0.63494 -0.16057 -0.02715  0.13481  1.17491 
+```
+
+The residual table indicates that the residuals are accumulated around 0, with the min being -0.61 and max being 0.85 The median is close to 0, and
+the upper and lower ranges are sufficiently close to each other, which indicates a close to symmetric distribution of the residuals. This is a good
+fit.
+
+Residual standard error: 0.2702 on 138 degrees of freedom
+
+Comparison: In the first regression model, the R-squared value is 80%, close to 82% to the third regressions. However, the distribution of the
+residuals in regression 1 is as follows:
+
+```         
+Residuals:
+     Min       1Q   Median       3Q      Max 
+-0.70197 -0.17530 -0.07598  0.08315  1.61302 
+```
+
+This is not a very symmetric fit of the residuals, and it can indicate the accumulation of the residuals in one side.
+
+Let us eliminate the variables so that only the significant variables are present:
+```{r}
+sign_vars<- c(2,4,6)
+df_significant <- df[, sign_vars]
+df_test_significant <- df_test[, sign_vars]
+regression3 <-lm(y3~., data=df_significant)
+summary(regression3)
+
+```
+The R-squared value does not change my that much, but we reduce our dimensions to 3: which is a major improvement and simplification. This one performs better results than PCA, which could reduce the dimensions to 8 only with preserving a variance data of 80%
+
+
+After this analysis, I will try to improve the regression model with respect to the 3rd selected column, because of the better fit of the residuals.
+
+Now, let us try a quadratic model with respect to the second component with significant and non-significant, since that one highly significant:
+
+```{r}
+model_quad <- lm(y3 ~ df[,1] + I(df[,2]^2) + df[,2] + df[,3] + df[,4] + df[,5] + df[,6] + df[,7] + df[,8] +df[,9]+df[,10]+df[,11], data=df)
+
+summary(model_quad)
+plot(model_quad)
+```
+The significant variables are comp1: linear case and component 4,6. Component 2 is in this case not significant. 
+
+When we add a quadratic term for the first component, the R-squared value is slightly better with 0.8235. However, we observe a similar pattern in the
+residuals plot and in the QQ plot.
+
+Let us try a cubic pattern:
+
+```{r}
+model_cubic <- lm(y3 ~ df[,1] + I(df[,2]^2) + I(df[,2]^3) + df[,2] + df[,3] + df[,4] + df[,5] + df[,6] + df[,7] + df[,8] +df[,9]+df[,10]+df[,11], data=df)
+summary(model_cubic)
+plot(model_cubic)
+```
+
+If we add a cubic degree term regarding component 1, the R square value reaches 0.8247, which is only slightly better. Residuals vs. Fitted plot shows
+closer points to the red line and much less of a pattern, which is closer to the points being randomly scattered around the red line and are
+independent. However, it does not make much of an improvement so it makes sense to stay with the second degree model or the first degree model.
+
+However, for a better model, we want to see a straight red line around 0.
+
+The fact that the points seem to be segmented into two parts might suggest that the variables do not have constant variance, which may be why our
+model is failing to capture a satisfying relationship (since linear regression works on a constant variance assumption).
+
+We observe, that the variables 91,105,97 are outliers and significantly affect our analysis. (The Cook's distance is almost greater than 4). Let us
+try removing those and computing our analysis once more.
+
+```{r}
+
+df_new <- df_significant[-c(91,97,105),]
+y3_new <- y3[-c(91,97,105)]
+
+y3<-c(real_new[[3]])
+regression3.2 <-lm(y3_new~., df_new)
+summary(regression3.2)
+```
+The resulting regression performs better when the dimensionality is reduced and the outliers are removed.
+
+```{r}
+model_q2 <- lm(y3_new ~ df_new[,1] + I(df_new[,2]^2)  + df_new[,2] + df_new[,3] + df_new[,4] + df_new[,5] + df_new[,6] + df_new[,7] + df_new[,8]+df_new[,9]+df_new[,10]+df_new[,11], df_new)
+summary(model_q2)
+
+```
+
+After the adjustment, we do see an improvement of fit in the linear model.
+
+The residuals vs. fitted plot indicates more of a pattern in the red line, which is an expected result of "overfitting". It makes sense to move with
+the first or second degree models.
+
+```{r}
+plot(model_q2)
+```
+
+\*Comparison of methods
+
+Exploratory analysis with PCA was not extremely successful in this case, since it could only reduce the dimensions from 11 to 8 when we tried to
+preserve approximately 85% of the variance information. This indicates that our data set cannot be reduced in dimension drastically without losing
+critical information.
+
+The regression worked best with a simple quadratic model, where we could reach up to 89% of preserving the information.
+
+This analysis implies, that the geometric dependencies of the electrical signal is indeed very complex. Every geometric feature has an impact on the
+signal strength, with some being stronger than the other such as Component 1: length of patch,2: width of patch,4: height of substrate and 6:radius of
+the probe. As a result of the regression analysis, these 4 features had the most impact on the signal strength. Therefore, the regression analysis was
+very sufficient and it fit the data well.
+
+The regression analysis with PCA would not have made much of a difference, since for a computer 8 and 11 are not 2 drastically different dimensions.
+However, if the dimensions and the size of the dataset was larger, we would have preferred to use the PCA reduced model for further analysis.
+
+In the first part where we checked the correlations in pairwise manner, we already concluded that Components 2 and 4 (width of patch and height of
+substrate) were already strongly and positively correlated. Now that we know they are significant in the determination of our y variable, we can
+combine them in one variable (maybe using a PCA approximation) to further simplify the model.
+
+Now, let us test the model with the input data that we segmented.
+
+```{r}
+predictions <- predict(model_quad, newdata = df_test)
+y3_test<-y3_all[193:385]
+# Calculate Mean Squared Error (MSE)
+mse <- mean((y3_test - predictions)^2)
+
+# Calculate Mean Absolute Error (MAE)
+mae <- mean(abs(y3_test - predictions))
+
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+```
+
+The squared mean standard error and the mean absolute error are at a reasonable level, which is an indication of our model being a good fit to the
+data.
+
+Now, let me consider the imaginary parts of the results. -Linear regression I use the selected columns that I chose in the analysis of real data, to
+properly detect any variances in fit.
+
+```{r}
+
+df <- as.data.frame(input_cleaned)
+y1<-c(img_new[[1]])
+regression1 <-lm(y1~., df)
+summary(regression1)
+
+y2<-c(img_new[[2]])
+regression2 <-lm(y2~., df)
+summary(regression2)
+
+y3<-c(img_new[[3]])
+regression3 <-lm(y3~., df)
+summary(regression3)
+
+
+y4<-c(img_new[[4]])
+regression4 <-lm(y4~., df)
+summary(regression4)
+```
+
+The obtained R-squared values are very very low, indicating a weaker relationship with the input variables. Therefore, the model where we use the real
+parts of the results is preferred.
+
+Check for correlations between the real and imaginary parts for the selected columns : There is no significant correlation present between the real
+and imaginary parts. Because the fit for the real parts of the results showed better performance, I will prefer the model with the real variables.
+
+```{r}
+cor(real_new,img_new)
+```
+
+
+
+
+In the preparation of this report, I got help from ChatGPT regarding the syntax of the language and understanding of the graphical outputs.
