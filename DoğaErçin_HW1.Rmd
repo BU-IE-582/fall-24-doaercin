@@ -227,15 +227,14 @@ img_new<- img_new[1:193,]
 regression1 <-lm(y1~., df)
 summary(regression1)
 
-
 regression2 <-lm(y2~., df)
 summary(regression2)
 
-y3<-c(real_new[[3]])
+
 regression3 <-lm(y3~., df)
 summary(regression3)
 
-y4<-c(real_new[[4]])
+
 regression4 <-lm(y4~., df)
 summary(regression4)
 ```
@@ -264,6 +263,7 @@ variable is explained by the predictors. The residual standard error is 0.2983, 
 
 Some components, such as Comp.3, Comp.5, Comp.7, and Comp.8, have high p-values (above 0.05), meaning that they have limited statistical significance.
 
+
 Third regression:
 
 ```         
@@ -289,9 +289,21 @@ Residuals:
 
 This is not a very symmetric fit of the residuals, and it can indicate the accumulation of the residuals in one side.
 
+Let us eliminate the variables so that only the significant variables are present:
+```{r}
+sign_vars<- c(2,4,6)
+df_significant <- df[, sign_vars]
+df_test_significant <- df_test[, sign_vars]
+regression3 <-lm(y3~., data=df_significant)
+summary(regression3)
+
+```
+The R-squared value does not change my that much, but we reduce our dimensions to 3: which is a major improvement and simplification. This one performs better results than PCA, which could reduce the dimensions to 8 only with preserving a variance data of 80%
+
+
 After this analysis, I will try to improve the regression model with respect to the 3rd selected column, because of the better fit of the residuals.
 
-Now, let us try a quadratic model with respect to the second component, since it is highly significant:
+Now, let us try a quadratic model with respect to the second component with significant and non-significant, since that one highly significant:
 
 ```{r}
 model_quad <- lm(y3 ~ df[,1] + I(df[,2]^2) + df[,2] + df[,3] + df[,4] + df[,5] + df[,6] + df[,7] + df[,8] +df[,9]+df[,10]+df[,11], data=df)
@@ -299,6 +311,7 @@ model_quad <- lm(y3 ~ df[,1] + I(df[,2]^2) + df[,2] + df[,3] + df[,4] + df[,5] +
 summary(model_quad)
 plot(model_quad)
 ```
+The significant variables are comp1: linear case and component 4,6. Component 2 is in this case not significant. 
 
 When we add a quadratic term for the first component, the R-squared value is slightly better with 0.8235. However, we observe a similar pattern in the
 residuals plot and in the QQ plot.
@@ -324,13 +337,17 @@ We observe, that the variables 91,105,97 are outliers and significantly affect o
 try removing those and computing our analysis once more.
 
 ```{r}
-df_new <- df[-c(91,97,105),]
+
+df_new <- df_significant[-c(91,97,105),]
 y3_new <- y3[-c(91,97,105)]
 
-y3<-c(real_new[[1]])
+y3<-c(real_new[[3]])
 regression3.2 <-lm(y3_new~., df_new)
 summary(regression3.2)
+```
+The resulting regression performs better when the dimensionality is reduced and the outliers are removed.
 
+```{r}
 model_q2 <- lm(y3_new ~ df_new[,1] + I(df_new[,2]^2)  + df_new[,2] + df_new[,3] + df_new[,4] + df_new[,5] + df_new[,6] + df_new[,7] + df_new[,8]+df_new[,9]+df_new[,10]+df_new[,11], df_new)
 summary(model_q2)
 
@@ -417,5 +434,8 @@ and imaginary parts. Because the fit for the real parts of the results showed be
 ```{r}
 cor(real_new,img_new)
 ```
+
+
+
 
 In the preparation of this report, I got help from ChatGPT regarding the syntax of the language and understanding of the graphical outputs.
