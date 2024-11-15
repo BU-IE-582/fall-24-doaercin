@@ -1,8 +1,4 @@
----
-editor_options: 
-  markdown: 
-    wrap: 150
----
+
 
 IE 582 : Statistical Learning for Data Mining
 
@@ -21,7 +17,7 @@ Machine learning techniques have gained popularity as a way to model the intrica
 potentially reducing computation time and resource requirements, given the extensive trial and error frequently needed to optimize antenna design.
 
 In order to analyse the real and imaginary components of S11, this project uses simulation data from 385 antenna frequencies that were recorded in the
-23–33 GHz frequency range. We investigate how machine learning can simplify and uncover underlying patterns in the antenna design by using techniques
+23- 33 GHz frequency range. We investigate how machine learning can simplify and uncover underlying patterns in the antenna design by using techniques
 like dimensionality reduction (PCA) and supervised learning.
 
 read files
