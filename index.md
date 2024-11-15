@@ -7,6 +7,8 @@ Whenever you commit to this repository, GitHub Pages will run [Jekyll](https://j
 *[HW1](files/DoğaErçin_HW1.Rmd)
 
 *[HW1_last](https://github.com/BU-IE-582/fall-24-doaercin-boun/blob/main/files/DoğaErçin_HW1.Rmd)
+
+*[HW1_last](https://github.com/BU-IE-582/fall-24-doaercin-boun/blob/main/files/DoğaErçin_HW1.html)
 ### Markdown
 
 Markdown is a lightweight and easy-to-use syntax for styling your writing. It includes conventions for
