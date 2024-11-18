@@ -1,6 +1,6 @@
 ## Doğa Erçin's Journal
 
-*[HW1_DogaErcin](files/DogaErcin_HW1.Rmd)
-*[HW1_DogaErcin]()
+*[HW1_DogaErcin_RMD](files/DogaErcin_HW1_last.Rmd)
+*[HW1_DogaErcin_HTML](files/DogaErcin_HW1_last.html)
 
 
