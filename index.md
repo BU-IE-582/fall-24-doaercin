@@ -8,6 +8,9 @@ Whenever you commit to this repository, GitHub Pages will run [Jekyll](https://j
 
 *[HW1_last](https://github.com/BU-IE-582/fall-24-doaercin-boun/blob/main/files/DogaErcin_HW1.Rmd)
 
+*[HW.](https://github.com/BU-IE-582/fall-24-doaercin/tree/main/files/DogaErcin_HW1.Rmd)
+*[HW.](files/DogaErcin_HW1.Rmd)
+
 
 ### Markdown
 
