@@ -1,0 +1,2201 @@
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(rpart)
+library(caret)
+library(rpart.plot)
+library(tidyr)
+library(rattle)
+library(glmnet)
+library(FSelectorRcpp)
+library(e1071)
+library(randomForest)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+```
+
+```{r}
+match_data <- read.csv("match_data.csv")
+```
+
+```{r}
+match_data <- match_data %>%
+  filter(suspended == "False" & stopped == "False")
+```
+
+```{r}
+match_data <- match_data %>%
+  mutate(
+    match_start_datetime = ymd_hms(match_start_datetime),
+    current_time = ymd_hms(current_time),
+    final_score = as.factor(final_score),
+    result = as.factor(result)
+  )
+```
+
+```{r}
+match_data <- match_data %>%
+  mutate(
+    P_home = 1 / `X1`,
+    P_draw = 1 / X,
+    P_away = 1 / `X2`
+  )
+match_data <- match_data %>%
+  mutate(
+    total_prob = P_home + P_draw + P_away,
+    P_home_norm = P_home / total_prob,
+    P_draw_norm = P_draw / total_prob,
+    P_away_norm = P_away / total_prob
+  )
+```
+
+
+
+```{r}
+matches_with_too_many_na <- match_data %>%
+  group_by(fixture_id) %>%
+  summarise(
+    X1_na_count = sum(is.na(X1)),
+    X2_na_count = sum(is.na(X2)),
+    X_na_count = sum(is.na(X))
+  ) %>%
+  filter(
+    X1_na_count > 10 | X2_na_count > 10 | X_na_count > 10
+  )
+
+matches_with_too_many_na
+```
+
+```{r}
+match_data_filled <- match_data %>%
+  group_by(fixture_id) %>%
+  mutate(across(
+    where(is.numeric), # Only apply to numeric columns
+    ~ {
+      # 1. If all values are NA, fill with 0
+      if (all(is.na(.))) {
+        return(rep(0, length(.)))
+      }
+      
+      # 2. If there are NA values at the start, fill with 0
+      filled <- replace_na(.x, 0)
+      
+      # 3. Apply both forward and backward filling
+      filled <- zoo::na.locf(filled, na.rm = FALSE) # Forward fill
+      filled <- zoo::na.locf(filled, fromLast = TRUE, na.rm = FALSE) # Backward fill
+      
+      # 4. Fill remaining NA values at the end with the last non-NA value
+      filled <- replace_na(filled, last(filled[!is.na(filled)]))
+      
+      return(filled)
+    }
+  )) %>%
+  ungroup()
+
+
+head(match_data_filled)
+```
+```{r}
+colSums(is.na(match_data_filled))
+```
+
+```{r}
+match_data_filled <- match_data_filled %>%
+  mutate(
+    total_minute = case_when(
+      halftime == "1st-half" ~ minute,                         
+      halftime == "2nd-half" ~ 45 + minute
+    )
+  )
+match_data_filled$result <- as.factor(match_data_filled$result)
+```
+
+
+
+
+```{r}
+## Interaction terms
+match_data_featured <- match_data_filled %>%
+  mutate(
+    goal_difference = `Goals...home` - `Goals...away`,
+    yellow_card_difference = `Yellowcards...home` - `Yellowcards...away`,
+    # Goal Impact
+    goal_elapsed_interaction = goal_difference * total_minute,
+    goal_yellowcards_home_interaction = goal_difference * `Yellowcards...home`,
+    goal_yellowcards_away_interaction = goal_difference * `Yellowcards...away`,
+    # Attack Efficiency
+    attack_efficiency_home = `Total.Crosses...home` * `Goals...home`,
+    interaction_passes_attacks_home = Passes...home * Attacks...home,
+    interaction_passes_attacks_away = Passes...away * Attacks...away,
+    attack_efficiency_away = `Total.Crosses...away` * `Goals...away`
+  )
+```
+
+```{r}
+match_data_featured$halftime <- ifelse(match_data_featured$halftime == "1st-half", 1, 
+                       ifelse(match_data_featured$halftime == "2nd-half", 2, NA))
+
+
+match_data_featured$current_state <- ifelse(match_data_featured$current_state == "X" | match_data_featured$current_state == "", 
+                                     0, 
+                                     match_data_featured$current_state)
+
+match_data_featured$result <- ifelse(match_data_featured$result == "X", 0, match_data_featured$result)
+match_data_featured$current_state <- as.numeric(match_data_featured$current_state)
+match_data_featured$result <- as.factor(match_data_featured$result)
+```
+
+```{r}
+initial_training_data <- match_data_featured %>% filter(match_start_datetime < "2024-11-01")
+initial_test_data <- match_data_featured %>% filter(match_start_datetime >= "2024-11-01")
+```
+
+```{r}
+unnecessary_cols <- c(
+  "fixture_id", "half_start_datetime", "match_start_datetime", 
+  "latest_bookmaker_update", "name", 
+  "current_time", "minute", "second", "suspended", "stopped", 
+  "ticking", "final_score", "Score.Change...away", 
+  "Score.Change...home", "P_home","P_away","P_draw"
+)
+```
+
+```{r}
+cleaned_training_data <- initial_training_data[, !(names(initial_training_data) %in% unnecessary_cols)]
+cleaned_test_data <- initial_test_data[, !(names(initial_test_data) %in% unnecessary_cols)]
+```
+
+```{r}
+library(corrplot)
+numeric_columns <- names(cleaned_training_data)[names(cleaned_training_data) != "result"]
+cor_matrix <- cor(cleaned_training_data[, numeric_columns], use = "complete.obs")
+cor_pairs <- as.data.frame(as.table(cor_matrix))
+cor_pairs <- cor_pairs[cor_pairs$Var1 != cor_pairs$Var2, ]
+cor_pairs <- cor_pairs[order(-abs(cor_pairs$Freq)), ]
+top_30_pairs <- head(cor_pairs, 30)
+print(top_30_pairs)
+```
+
+
+```{r}
+str(cleaned_training_data)
+```
+```{r}
+any(is.na(cleaned_training_data))
+```
+```{r}
+feature_scores <- information_gain(result ~ ., data = cleaned_training_data)
+```
+
+```{r}
+str(feature_scores)
+feature_scores$importance <- as.numeric(feature_scores$importance)
+selected_features <- rownames(feature_scores)[feature_scores$importance > mean(feature_scores$importance, na.rm = TRUE)]
+print(selected_features)
+```
+
+```{r}
+dt_model <- rpart(result ~ ., data = cleaned_training_data, method = "class",control = rpart.control(cp = 0.001, minsplit = 10, maxdepth = 15))
+```
+
+```{r}
+rpart.plot(dt_model)
+```
+
+```{r}
+variable_importance <- dt_model$variable.importance
+print(variable_importance)
+```
+
+As can be seen from these results, adding the interaction terms goal_yellowcards_away_interaction attack_efficiency_away oal_yellowcards_home_interaction yellow_card_difference to the model does not leave room for improvement in the model and increases the risk of overfitting.
+
+```{r}
+importance_df <- data.frame(
+  Feature = names(variable_importance),
+  Importance = variable_importance
+)
+
+top_10_importance_df <- importance_df[1:10, ]  
+ggplot(top_10_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  
+  labs(title = "Top 10 Feature Importance", x = "Features", y = "Importance") +
+  theme_minimal()
+```
+
+
+```{r}
+tree_model_predictions <- predict(dt_model, newdata = initial_test_data, type = "class")
+conf_matrix <- confusionMatrix(tree_model_predictions, initial_test_data$result)
+print(conf_matrix)
+```
+
+
+
+```{r}
+unnecessary_cols2 <- c(
+  "half_start_datetime", "match_start_datetime", 
+  "latest_bookmaker_update", "name", 
+  "current_time", "minute", "second", "suspended", "stopped", 
+  "ticking", "final_score", "Score.Change...away", 
+  "Score.Change...home"
+)
+```
+
+```{r}
+
+cleaned_data <- match_data_featured[, !(names(match_data_featured) %in% unnecessary_cols2)]
+
+first_minutes <- cleaned_data %>%
+  group_by(fixture_id) %>%
+  slice(1) %>%
+  ungroup()
+
+# P_home_norm ile P_away_norm arasındaki farkı hesaplama
+first_minutes <- first_minutes %>%
+  mutate(home_away_diff = P_home_norm - P_away_norm)
+
+
+```
+
+```{r}
+# Calculate the 33.33rd and 66.67th percentiles
+thresholds <- quantile(first_minutes$home_away_diff, probs = c(0.3333, 0.6667))
+print(thresholds)
+```
+
+```{r}
+first_minutes <- first_minutes[order(abs(first_minutes$home_away_diff)), ]
+
+n <- nrow(first_minutes)
+group_size <- ceiling(n / 3)
+
+# Create a new column to assign groups
+first_minutes$category <- c(
+  rep("Good", group_size),
+  rep("Medium", group_size),
+  rep("Bad", n - 2 * group_size) # Remaining entries go to the last group
+)
+
+# Display the updated table
+print(first_minutes)
+```
+
+```{r}
+
+lookup_table <- first_minutes[, c("fixture_id", "category")]
+colnames(lookup_table) <- c("fixture_id", "category") 
+
+cleaned_data <- merge(cleaned_data, lookup_table, by = "fixture_id", all.x = TRUE)
+cleaned_data <- cleaned_data %>%
+  mutate(home_away_diff = abs(P_home_norm - P_away_norm))
+
+print(cleaned_data)
+```
+```{r}
+match_data$match_start_datetime <- as.Date(match_data$match_start_datetime, format = "%d.%m.%Y")
+
+training_list <- match_data$fixture_id[match_data$match_start_datetime < as.Date("2024-11-01")]
+test_list <- match_data$fixture_id[match_data$match_start_datetime >= as.Date("2024-11-01")]
+last_training_data <- cleaned_data[cleaned_data$fixture_id %in% training_list, ]
+last_test_data <- cleaned_data[cleaned_data$fixture_id %in% test_list, ]
+
+```
+
+
+```{r}
+ggplot(last_training_data, aes(x = total_minute, y = home_away_diff, color = category, group = fixture_id)) +
+  geom_line(linewidth = 1) +  
+  labs(
+    title = "Home-Away Difference Over Total Minutes",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Category"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+```
+
+
+```{r}
+
+bad_category_data <- last_training_data %>%
+  filter(category == "Bad")
+
+ggplot(bad_category_data, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Category: Bad)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+
+```
+```{r}
+set.seed(123)
+random_fixture_ids <- sample(unique(bad_category_data$fixture_id), 50)
+random_sample_data <- bad_category_data %>%
+  filter(fixture_id %in% random_fixture_ids)
+
+
+ggplot(random_sample_data, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Random 50 Matches, Category: Bad)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none" 
+  )
+```
+
+```{r}
+
+std_dev_per_minute <- bad_category_data %>%
+  group_by(total_minute) %>%
+  summarise(std_dev = sd(home_away_diff, na.rm = TRUE))
+
+average_std_dev <- mean(std_dev_per_minute$std_dev, na.rm = TRUE)
+
+
+print(average_std_dev)
+print(std_dev_per_minute)
+```
+
+
+```{r}
+library(qcc)
+
+std_dev_per_minute <- std_dev_per_minute %>%
+  mutate(std_dev_diff = std_dev - lag(std_dev)) %>%
+  filter(!is.na(std_dev_diff)) 
+xbar_data <- std_dev_per_minute$std_dev_diff
+
+custom_sigma <- sd(xbar_data, na.rm = TRUE) * 0.25
+
+xbar_chart <- qcc(data = xbar_data, 
+                  type = "xbar.one", 
+                  std.dev = custom_sigma, 
+                  title = "X-bar Chart for Std Dev Differences (Reduced Sigma)",
+                  xlab = "Minutes",
+                  ylab = "Std Dev Difference")
+
+
+```
+
+```{r}
+cusum_chart <- cusum(xbar_data,decision.interval = 4, se.shift = 0.25)
+```
+
+```{r}
+good_category_data <- last_training_data %>%
+  filter(category == "Good")
+
+ggplot(good_category_data, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Category: Good)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+```
+```{r}
+set.seed(123)
+random_fixture_ids_good <- sample(unique(good_category_data$fixture_id), 50)
+random_sample_data_good <- good_category_data %>%
+  filter(fixture_id %in% random_fixture_ids)
+
+
+ggplot(random_sample_data_good, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Random 50 Matches, Category: Good)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none" 
+  )
+```
+```{r}
+
+std_dev_per_minute_good <- good_category_data %>%
+  group_by(total_minute) %>%
+  summarise(std_dev = sd(home_away_diff, na.rm = TRUE))
+
+average_std_dev_good <- mean(std_dev_per_minute_good$std_dev, na.rm = TRUE)
+
+
+print(average_std_dev_good)
+print(std_dev_per_minute_good)
+```
+```{r}
+std_dev_per_minute_good <- std_dev_per_minute_good %>%
+  mutate(std_dev_diff = std_dev - lag(std_dev)) %>%
+  filter(!is.na(std_dev_diff)) 
+xbar_data_good <- std_dev_per_minute_good$std_dev_diff
+
+custom_sigma_good <- sd(xbar_data_good, na.rm = TRUE) * 0.25
+
+xbar_chart_good <- qcc(data = xbar_data_good, 
+                  type = "xbar.one", 
+                  std.dev = custom_sigma_good, 
+                  title = "X-bar Chart for Std Dev Differences (Reduced Sigma)",
+                  xlab = "Minutes",
+                  ylab = "Std Dev Difference")
+
+```
+
+```{r}
+cusum_chart <- cusum(xbar_data_good,decision.interval = 4, se.shift = 1)
+```
+
+```{r}
+medium_category_data <- last_training_data %>%
+  filter(category == "Medium")
+
+ggplot(medium_category_data, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Category: Medium)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+```{r}
+set.seed(123)
+random_fixture_ids_medium <- sample(unique(medium_category_data$fixture_id), 50)
+random_sample_data_medium <- medium_category_data %>%
+  filter(fixture_id %in% random_fixture_ids_medium)
+
+
+ggplot(random_sample_data_medium, aes(x = total_minute, y = home_away_diff, group = fixture_id, color = as.factor(fixture_id))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Home-Away Difference Over Total Minutes (Random 50 Matches, Category: Medium)",
+    x = "Total Minutes",
+    y = "Home-Away Difference",
+    color = "Match ID"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none" 
+  )
+```
+```{r}
+std_dev_per_minute_medium <- medium_category_data %>%
+  group_by(total_minute) %>%
+  summarise(std_dev = sd(home_away_diff, na.rm = TRUE))
+
+average_std_dev_medium <- mean(std_dev_per_minute_medium$std_dev, na.rm = TRUE)
+
+
+print(average_std_dev_medium)
+print(std_dev_per_minute_medium)
+```
+```{r}
+std_dev_per_minute_medium <- std_dev_per_minute_medium %>%
+  mutate(std_dev_diff = std_dev - lag(std_dev)) %>%
+  filter(!is.na(std_dev_diff)) 
+xbar_data_medium <- std_dev_per_minute_medium$std_dev_diff
+
+custom_sigma_medium <- sd(xbar_data_medium, na.rm = TRUE) * 0.25
+
+xbar_chart_medium <- qcc(data = xbar_data_medium, 
+                  type = "xbar.one", 
+                  std.dev = custom_sigma_medium, 
+                  title = "X-bar Chart for Std Dev Differences (Reduced Sigma)",
+                  xlab = "Minutes",
+                  ylab = "Std Dev Difference")
+
+
+```
+```{r}
+cusum_chart_medium <- cusum(xbar_data_medium,decision.interval = 4, se.shift = 1)
+```
+
+```{r}
+
+grouped_data_bad <- std_dev_per_minute %>%
+  mutate(group = floor(total_minute / 3)) %>%
+  group_by(group) %>%
+  summarise(mean_diff = mean(std_dev_diff, na.rm = TRUE))
+
+xbar_data_grouped_bad <- grouped_data_bad$mean_diff
+cusum_chart_bad <- cusum(xbar_data_grouped_bad,decision.interval = 4, se.shift = 1)
+
+xbar_chart_bad <- qcc(data = xbar_data_grouped_bad, 
+                  type = "xbar.one", 
+                  title = "X-bar Chart for Std Dev Differences (Grouped Data)",
+                  xlab = "3-minute Intervals",
+                  ylab = "Mean Std Dev Difference")
+```
+```{r}
+grouped_data_good <- std_dev_per_minute_good %>%
+  mutate(group = floor(total_minute / 3)) %>%
+  group_by(group) %>%
+  summarise(mean_diff = mean(std_dev_diff, na.rm = TRUE))
+
+xbar_data_grouped_good <- grouped_data_good$mean_diff
+
+cusum_chart_good <- cusum(xbar_data_grouped_good,decision.interval = 4, se.shift = 1)
+
+xbar_chart_good <- qcc(data = xbar_data_grouped_good, 
+                  type = "xbar.one", 
+                  title = "X-bar Chart for Std Dev Differences (Grouped Data)",
+                  xlab = "3-minute Intervals",
+                  ylab = "Mean Std Dev Difference")
+```
+
+```{r}
+grouped_data_medium <- std_dev_per_minute_medium %>%
+  mutate(group = floor(total_minute / 3)) %>%
+  group_by(group) %>%
+  summarise(mean_diff = mean(std_dev_diff, na.rm = TRUE))
+
+xbar_data_grouped_medium <- grouped_data_medium$mean_diff
+
+cusum_chart_medium <- cusum(xbar_data_grouped_medium,decision.interval = 4, se.shift = 1)
+
+xbar_chart_medium <- qcc(data = xbar_data_grouped_medium, 
+                  type = "xbar.one", 
+                  title = "X-bar Chart for Std Dev Differences (Grouped Data)",
+                  xlab = "3-minute Intervals",
+                  ylab = "Mean Std Dev Difference")
+```
+
+Base model: DT
+
+```{r}
+last_training_data <- last_training_data[, !colnames(last_training_data) %in% c("fixture_id")]
+predictors <- last_training_data
+target <- last_training_data$result
+
+formula <- result ~ .
+rf_train_data <- data.frame(predictors, result = target)
+
+
+train_control <- trainControl(method = "cv", number = 4)
+
+# Set hyperparameters for tuning
+tune_grid <- expand.grid(cp = 0.08) # Complexity parameter
+
+# Train the model using rpart
+rpart_model <- train(
+  formula,
+  data = rf_train_data,
+  method = "rpart",
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Display the best model
+print(rpart_model$bestTune)
+
+conf_matrix <- confusionMatrix(tree_model_predictions, initial_test_data$result)
+
+print(conf_matrix)
+
+# Print only the accuracy
+cat("Decision Tree Accuracy:", conf_matrix$overall["Accuracy"], "\n")
+# Plot the model performance
+#plot(rpart_model)
+```
+Select complexity parameter as 0.08 as a result of analysis.
+
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+last_training_data <- last_training_data[, !colnames(last_training_data) %in% c("fixture_id")]
+predictors <- last_training_data[, !colnames(last_training_data) %in% c("result")]
+target <- last_training_data$result
+
+# Create a data frame for caret
+rf_train_data <- data.frame(predictors, target)
+
+# Define the training control with 10-fold cross-validation
+train_control <- trainControl(method = "cv", number = 4)
+
+
+#COMBINE TUNE GRIDS!!!
+# Define the grid for mtry and cp
+tune_grid <- expand.grid(
+  mtry = c(3)             
+)
+
+
+# Custom Random Forest model wrapper for caret
+custom_rf <- list(
+  type = "Classification",
+  library = "randomForest",
+  loop = NULL,
+  parameters = data.frame(
+    parameter = c("mtry"),
+    class = c("numeric"),
+    label = c("mtry")
+  ),
+  grid = function(x, y, len = NULL, search = "grid") {
+    expand.grid(
+      mtry = seq(2, ncol(x), length.out = len),
+      cp = seq(0.01, 0.1, length.out = len)
+    )
+  },
+  fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+    randomForest(x = x, y = y, mtry = param$mtry, ntree = 300, maxnodes = 10, ...)
+  },
+  predict = function(modelFit, newdata, submodels = NULL) {
+    predict(modelFit, newdata)
+  },
+  prob = function(modelFit, newdata, submodels = NULL) {
+    predict(modelFit, newdata, type = "prob")
+  },
+  varImp = function(object, ...) {
+    varImp(object, ...)
+  }
+)
+
+rf_train_data$target <- as.factor(rf_train_data$target)
+# Fit the Random Forest model with caret
+rf_model <- train(
+  target ~ ., 
+  data = rf_train_data,
+  method = custom_rf,
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Look at all the results (including Accuracy, Kappa, etc.)
+print(rf_model$results)
+
+# Extract the accuracy specifically for the best mtry
+best_mtry <- rf_model$bestTune$mtry
+best_row  <- rf_model$results$mtry == best_mtry
+best_accuracy <- rf_model$results$Accuracy[best_row]
+
+cat("Cross-validated Accuracy:", best_accuracy, "\n")
+
+# Display the best model parameters
+print(rf_model$bestTune)
+final_rf_model <- rf_model$finalModel
+print(final_rf_model)
+
+
+```
+
+
+```{r}
+last_test_data <- cleaned_data[cleaned_data$fixture_id %in% test_list, ]
+last_test_data <- last_test_data[, !colnames(last_test_data)%in%c("fixture_id")]
+
+last_training_data <- last_training_data[, !colnames(last_training_data)%in%c("fixture_id")]
+```
+
+#```{r}
+set.seed(123)
+
+tune_out <- e1071::tune(
+  METHOD= svm, 
+  train.x = result ~ ., 
+  data = last_training_data, 
+  kernel = "radial", 
+  ranges = list(cost = c(0.1, 1, 10), gamma = c(0.01, 0.1, 1))
+)
+
+# Print the best parameters
+print(tune_out$best.parameters)
+
+# Train an SVM model with the best parameters from tuning
+best_cost <- tune_out$best.parameters$cost
+best_gamma <- tune_out$best.parameters$gamma
+
+svm_model <- svm(
+  result ~ ., 
+  data = last_training_data, 
+  kernel = "radial", 
+  cost = best_cost, 
+  gamma = best_gamma,
+  probability=TRUE
+)
+
+# Make predictions on the test data
+svm_predictions <- predict(svm_model, newdata = cleaned_test_data, probability=TRUE)
+
+# Evaluate the model using confusion matrix
+conf_matrix_svm <- confusionMatrix(svm_predictions, cleaned_test_data$result)
+
+# Print SVM accuracy
+print("SVM Accuracy:")
+print(conf_matrix_svm$overall["Accuracy"])
+
+```
+
+#```{r}
+selected_features <- importance_df[1:10, "Feature"]
+reduced_training_data <- last_training_data[, c(selected_features, "result")]
+reduced_test_data <- last_test_data[, c(selected_features, "result")]
+
+
+set.seed(120)
+tune_out <- e1071::tune(
+  METHOD = svm,
+  result ~ ., 
+  data = reduced_training_data, 
+  kernel = "radial", 
+  #ranges = list(cost = c(0.1, 1, 10), gamma = c(0.01, 0.1, 1))
+  ranges = list(cost = c(1), gamma = c(0.1))
+)
+
+print(tune_out$best.parameters)
+
+# Train the final SVM model with the best parameters
+best_cost <- tune_out$best.parameters$cost
+best_gamma <- tune_out$best.parameters$gamma
+
+svm_model <- svm(
+  result ~ ., 
+  data = reduced_training_data, 
+  kernel = "radial", 
+  cost = best_cost, 
+  gamma = best_gamma
+)
+
+# Make predictions on the test data
+svm_predictions <- predict(svm_model, newdata = reduced_test_data)
+
+# Evaluate the model using confusion matrix
+conf_matrix_svm <- confusionMatrix(svm_predictions, reduced_test_data$result)
+
+# Print SVM accuracy
+print("SVM Accuracy:")
+print(conf_matrix_svm$overall["Accuracy"])
+```
+
+```{r}
+library(nnet)
+last_training_data$result <- as.factor(last_training_data$result)
+multinom_model <- multinom(result ~ ., data = last_training_data)
+summary(multinom_model)
+predicted_probs <- predict(multinom_model, newdata = last_training_data, type = "probs")
+predicted_classes <- predict(multinom_model, newdata = last_training_data, type = "class")
+conf_matrix <- confusionMatrix(predicted_classes, last_training_data$result)
+print("Multinomial Logistic Regression Accuracy:")
+print(conf_matrix$overall["Accuracy"])
+```
+
+
+
+
+```{r}
+good_test_data <- last_test_data[last_test_data$category == "Good", ]
+medium_test_data <- last_test_data[last_test_data$category == "Medium", ]
+bad_test_data <- last_test_data[last_test_data$category == "Bad", ]
+
+
+good_category_data <- good_category_data[, !colnames(good_category_data)%in%c("fixture_id")]
+medium_category_data <- medium_category_data[, !colnames(medium_category_data)%in%c("fixture_id")]
+bad_category_data <- bad_category_data[, !colnames(bad_category_data)%in%c("fixture_id")]
+
+
+
+good_category_data$category <- NULL
+medium_category_data$category <- NULL
+bad_category_data$category <- NULL
+
+good_test_data$category <- NULL
+medium_test_data$category <- NULL
+bad_test_data$category <- NULL
+
+
+```
+
+```{r}
+library(xgboost)
+
+#good
+good_target <- as.numeric(as.character(good_category_data$result))
+good_features <- good_category_data[, !names(good_category_data) %in% "result"]
+
+good_matrix <- xgb.DMatrix(data = as.matrix(good_features), label = good_target)
+
+params <- list(
+  objective = "multi:softmax",  
+  num_class = 3, 
+  eval_metric = "merror",
+  eta = 0.05, 
+  max_depth = 3,
+  nthread = 2
+)
+
+num_round <- 100
+
+model_good <- xgb.train(
+  params = params,
+  data = good_matrix,
+  nrounds = num_round
+)
+
+#testing
+preds_good <- predict(model_good, good_matrix)
+conf_matrix_good <- confusionMatrix(as.factor(preds_good), as.factor(good_target))
+cat("\n-- Good Category --\n")
+print(conf_matrix_good)
+
+good_test_target <- good_test_data$result
+good_test_features <- good_test_data[, !names(good_test_data) %in% "result"]
+
+good_test_matrix <- xgb.DMatrix(data = as.matrix(good_test_features))
+
+preds_good_test <- predict(model_good, good_test_matrix)
+
+conf_matrix_good_test <- confusionMatrix(
+  as.factor(preds_good_test),
+  as.factor(good_test_target)
+)
+
+cat("\n-- Good Category TEST --\n")
+print(conf_matrix_good_test)
+
+
+```
+```{r}
+medium_target <- as.numeric(as.character(medium_category_data$result))
+medium_features <- medium_category_data[, !names(medium_category_data) %in% "result"]
+
+medium_matrix <- xgb.DMatrix(data = as.matrix(medium_features), label = medium_target)
+
+params <- list(
+  objective = "multi:softmax",  
+  num_class = 3, 
+  eval_metric = "merror",
+  eta = 0.05, 
+  max_depth = 3,
+  nthread = 2
+)
+
+num_round <- 100
+
+model_medium <- xgb.train(
+  params = params,
+  data = medium_matrix,
+  nrounds = num_round
+)
+
+#testing
+preds_medium <- predict(model_medium, medium_matrix)
+conf_matrix_medium <- confusionMatrix(as.factor(preds_medium), as.factor(medium_target))
+cat("\n-- medium Category --\n")
+print(conf_matrix_medium)
+
+medium_test_target <- medium_test_data$result
+medium_test_features <- medium_test_data[, !names(medium_test_data) %in% "result"]
+
+medium_test_matrix <- xgb.DMatrix(data = as.matrix(medium_test_features))
+
+preds_medium_test <- predict(model_medium, medium_test_matrix)
+
+conf_matrix_medium_test <- confusionMatrix(
+  as.factor(preds_medium_test),
+  as.factor(medium_test_target)
+)
+
+cat("\n-- medium Category TEST --\n")
+print(conf_matrix_medium_test)
+```
+```{r}
+bad_target <- as.numeric(as.character(bad_category_data$result))
+bad_features <- bad_category_data[, !names(bad_category_data) %in% "result"]
+
+bad_matrix <- xgb.DMatrix(data = as.matrix(bad_features), label = bad_target)
+
+params <- list(
+  objective = "multi:softmax",  
+  num_class = 3, 
+  eval_metric = "merror",
+  eta = 0.05, 
+  max_depth = 3,
+  nthread = 2
+)
+
+num_round <- 100
+
+model_bad <- xgb.train(
+  params = params,
+  data = bad_matrix,
+  nrounds = num_round
+)
+
+#testing
+preds_bad <- predict(model_bad, bad_matrix)
+conf_matrix_bad <- confusionMatrix(as.factor(preds_bad), as.factor(bad_target))
+cat("\n-- bad Category --\n")
+print(conf_matrix_bad)
+
+bad_test_target <- bad_test_data$result
+bad_test_features <- bad_test_data[, !names(bad_test_data) %in% "result"]
+
+bad_test_matrix <- xgb.DMatrix(data = as.matrix(bad_test_features))
+
+preds_bad_test <- predict(model_bad, bad_test_matrix)
+
+conf_matrix_bad_test <- confusionMatrix(
+  as.factor(preds_bad_test),
+  as.factor(bad_test_target)
+)
+
+cat("\n-- bad Category TEST --\n")
+print(conf_matrix_bad_test)
+```
+
+```{r}
+good_test_data2 <- last_test_data[last_test_data$category == "Good", ]
+medium_test_data2 <- last_test_data[last_test_data$category == "Medium", ]
+bad_test_data2 <- last_test_data[last_test_data$category == "Bad", ]
+
+```
+
+```{r}
+
+filter_by_minute <- function(data, prediction_minute) {
+  data %>% filter(total_minute == prediction_minute)
+}
+
+good_test_data_filtered <- filter_by_minute(good_test_data2, 36)
+medium_test_data_filtered <- filter_by_minute(medium_test_data2, 30)
+bad_test_data_filtered <- filter_by_minute(bad_test_data2, 25)
+```
+
+
+```{r}
+trained_model <- rpart(result ~ ., data = last_training_data, method = "class", 
+                    control = rpart.control(cp = 0.001, minsplit = 10, maxdepth = 15))
+```
+
+
+```{r}
+good_predictions <- predict(trained_model, newdata = good_test_data_filtered, type = "class")
+medium_predictions <- predict(trained_model, newdata = medium_test_data_filtered, type = "class")
+bad_predictions <- predict(trained_model, newdata = bad_test_data_filtered, type = "class")
+```
+
+```{r}
+conf_matrix_good_base <- confusionMatrix(good_predictions, good_test_data_filtered$result)
+print(conf_matrix_good_base)
+```
+
+```{r}
+conf_matrix_medium_base <- confusionMatrix(medium_predictions, medium_test_data_filtered$result)
+print(conf_matrix_medium_base)
+```
+
+```{r}
+conf_matrix_bad_base <- confusionMatrix(bad_predictions, bad_test_data_filtered$result)
+print(conf_matrix_bad_base)
+```
+
+```{r}
+good_base_results <- good_test_data_filtered %>%
+  mutate(
+    predicted_result = good_predictions,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+pred_probs_good_dt <- predict(trained_model, newdata = good_test_data_filtered, type = "prob")
+```
+
+
+```{r}
+# Define a range of thresholds to test for the Good category
+good_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Good category
+good_results <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Good category
+for (good_thresh in good_thresholds) {
+  good_results_filtered <- good_test_data_filtered %>%
+    mutate(
+      predicted_result_good = good_predictions,
+      predicted_prob_good = case_when(
+        predicted_result_good == 1 ~ pred_probs_good_dt[, "1"],  
+        predicted_result_good == 2 ~ pred_probs_good_dt[, "2"],  
+        predicted_result_good == 0 ~ pred_probs_good_dt[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,
+        predicted_result_good == 1 & result == 1 ~ X1,  
+        predicted_result_good == 2 & result == 2 ~ X2,  
+        predicted_result_good == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_good = case_when(
+        predicted_prob_good < good_thresh ~ 0, 
+        match_return_good > 0 ~ match_return_good,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Good category
+  total_return_good <- sum(good_results_filtered$match_return_good, na.rm = TRUE)
+  total_profit_good <- sum(good_results_filtered$profit_good, na.rm = TRUE)
+  
+  # Store results for this threshold
+  good_results <- rbind(good_results, data.frame(threshold = good_thresh, total_return = total_return_good, total_profit = total_profit_good))
+}
+
+# Find the threshold with the highest total profit for the Good category
+optimal_good_threshold <- good_results[which.max(good_results$total_profit), ]
+
+# Print the results
+print(good_results)
+print(paste("Optimal Threshold for Good Category:", optimal_good_threshold$threshold))
+print(paste("Maximum Total Return for Good Category:", optimal_good_threshold$total_return))
+print(paste("Maximum Total Profit for Good Category:", optimal_good_threshold$total_profit))
+
+```
+
+```{r}
+total_return_base_good <- sum(good_base_results$match_return, na.rm = TRUE)
+average_return_base_good <- mean(good_base_results$match_return, na.rm = TRUE)
+total_profit_base_good <- sum(good_base_results$profit, na.rm = TRUE)
+average_profit_base_good <- mean(good_base_results$profit, na.rm = TRUE)
+print(paste("Total Return for Good Category:", total_return_base_good))
+print(paste("Average Return per Good Category Match:", average_return_base_good))
+print(paste("Total Profit for Good Category:", total_profit_base_good))
+print(paste("Average Profit per Good Category Match:", average_profit_base_good))
+```
+
+```{r}
+medium_base_results <- medium_test_data_filtered %>%
+  mutate(
+    predicted_result = medium_predictions,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+pred_probs_medium_dt <- predict(trained_model, newdata = medium_test_data_filtered, type = "prob")
+```
+
+
+```{r}
+total_return_base_medium <- sum(medium_base_results$match_return, na.rm = TRUE)
+average_return_base_medium <- mean(medium_base_results$match_return, na.rm = TRUE)
+total_profit_base_medium <- sum(medium_base_results$profit, na.rm = TRUE)
+average_profit_base_medium <- mean(medium_base_results$profit, na.rm = TRUE)
+print(paste("Total Return for Medium Category:", total_return_base_medium))
+print(paste("Average Return per Medium Category Match:", average_return_base_medium))
+print(paste("Total Profit for Medium Category:", total_profit_base_medium))
+print(paste("Average Profit per Medium Category Match:", average_profit_base_medium))
+```
+```{r}
+thresholds <- seq(0.50, 0.90, by = 0.01)
+
+results <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+for (thresh in thresholds) {
+  medium_results <- medium_test_data_filtered %>%
+    mutate(
+      predicted_result = medium_predictions,
+      predicted_prob = case_when(
+        predicted_result == 1 ~ pred_probs_medium_dt[, "1"],  
+        predicted_result == 2 ~ pred_probs_medium_dt[, "2"],  
+        predicted_result == 0 ~ pred_probs_medium_dt[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return = case_when(
+        predicted_prob < thresh ~ 0,
+        predicted_result == 1 & result == 1 ~ X1,  
+        predicted_result == 2 & result == 2 ~ X2,  
+        predicted_result == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit = case_when(
+        predicted_prob < thresh ~ 0, 
+        match_return > 0 ~ match_return,  
+        TRUE ~ -1
+      )
+    )
+  
+  
+  total_return <- sum(medium_results$match_return, na.rm = TRUE)
+  total_profit <- sum(medium_results$profit, na.rm = TRUE)
+  
+  
+  results <- rbind(results, data.frame(threshold = thresh, total_return = total_return, total_profit = total_profit))
+}
+
+
+optimal_threshold <- results[which.max(results$total_profit), ]
+
+print(results)
+print(paste("Optimal Threshold:", optimal_threshold$threshold))
+print(paste("Maximum Total Return:", optimal_threshold$total_return))
+print(paste("Maximum Total Profit:", optimal_threshold$total_profit))
+
+```
+```{r}
+pred_probs_bad_dt <- predict(trained_model, newdata = bad_test_data_filtered, type = "prob")
+```
+
+```{r}
+bad_base_results <- bad_test_data_filtered %>%
+  mutate(
+    predicted_result = bad_predictions,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+bad_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+bad_results <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+for (bad_thresh in bad_thresholds) {
+  bad_results_filtered <- bad_test_data_filtered %>%
+    mutate(
+      predicted_result_bad = bad_predictions,
+      predicted_prob_bad = case_when(
+        predicted_result_bad == 1 ~ pred_probs_bad_dt[, "1"],  
+        predicted_result_bad == 2 ~ pred_probs_bad_dt[, "2"],  
+        predicted_result_bad == 0 ~ pred_probs_bad_dt[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,
+        predicted_result_bad == 1 & result == 1 ~ X1,  
+        predicted_result_bad == 2 & result == 2 ~ X2,  
+        predicted_result_bad == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0, 
+        match_return_bad > 0 ~ match_return_bad,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Bad category
+  total_return_bad <- sum(bad_results_filtered$match_return_bad, na.rm = TRUE)
+  total_profit_bad <- sum(bad_results_filtered$profit_bad, na.rm = TRUE)
+  
+  # Store results for this threshold
+  bad_results <- rbind(bad_results, data.frame(threshold = bad_thresh, total_return = total_return_bad, total_profit = total_profit_bad))
+}
+
+# Find the threshold with the highest total profit for the Bad category
+optimal_bad_threshold <- bad_results[which.max(bad_results$total_profit), ]
+
+# Print the results
+print(bad_results)
+print(paste("Optimal Threshold for Bad Category:", optimal_bad_threshold$threshold))
+print(paste("Maximum Total Return for Bad Category:", optimal_bad_threshold$total_return))
+print(paste("Maximum Total Profit for Bad Category:", optimal_bad_threshold$total_profit))
+
+```
+
+```{r}
+total_return_base_bad <- sum(bad_base_results$match_return, na.rm = TRUE)
+average_return_base_bad <- mean(bad_base_results$match_return, na.rm = TRUE)
+total_profit_base_bad <- sum(bad_base_results$profit, na.rm = TRUE)
+average_profit_base_bad <- mean(bad_base_results$profit, na.rm = TRUE)
+print(paste("Total Return for Bad Category:", total_return_base_bad))
+print(paste("Average Return per Bad Category Match:", average_return_base_bad))
+print(paste("Total Profit for Bad Category:", total_profit_base_bad))
+print(paste("Average Profit per Bad Category Match:", average_profit_base_bad))
+```
+
+```{r}
+pred_probs_good_dt <- predict(trained_model, newdata = good_test_data_filtered, type = "prob")
+```
+
+```{r}
+good_predictions_multinom <- predict(multinom_model, newdata = good_test_data_filtered, type = "class")
+medium_predictions_multinom <- predict(multinom_model, newdata = medium_test_data_filtered, type = "class")
+bad_predictions_multinom <- predict(multinom_model, newdata = bad_test_data_filtered, type = "class")
+```
+
+```{r}
+conf_matrix_good_multinom <- confusionMatrix(good_predictions_multinom, good_test_data_filtered$result)
+print(conf_matrix_good_multinom)
+```
+
+```{r}
+conf_matrix_medium_multinom <- confusionMatrix(medium_predictions_multinom, medium_test_data_filtered$result)
+print(conf_matrix_medium_multinom)
+```
+
+```{r}
+conf_matrix_bad_multinom <- confusionMatrix(bad_predictions_multinom, bad_test_data_filtered$result)
+print(conf_matrix_bad_multinom)
+```
+
+```{r}
+pred_probs_good_multinom <- predict(multinom_model, newdata = good_test_data_filtered, type = "prob")
+pred_probs_medium_multinom <- predict(multinom_model, newdata = medium_test_data_filtered, type = "prob")
+pred_probs_bad_multinom <- predict(multinom_model, newdata = bad_test_data_filtered, type = "prob")
+```
+
+
+```{r}
+good_multinom_results <- good_test_data_filtered %>%
+  mutate(
+    predicted_result = good_predictions_multinom,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+# Define a range of thresholds to test for the Good category
+good_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Good category
+good_results_multinom <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Good category
+for (good_thresh in good_thresholds) {
+  good_results_filtered <- good_test_data_filtered %>%
+    mutate(
+      predicted_result_good = good_predictions_multinom,  # Predictions from multinom model
+      predicted_prob_good = case_when(
+        predicted_result_good == 1 ~ pred_probs_good_multinom[, "1"],  
+        predicted_result_good == 2 ~ pred_probs_good_multinom[, "2"],  
+        predicted_result_good == 0 ~ pred_probs_good_multinom[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        predicted_result_good == 1 & result == 1 ~ X1,  
+        predicted_result_good == 2 & result == 2 ~ X2,  
+        predicted_result_good == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        match_return_good > 0 ~ match_return_good,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Good category
+  total_return_good <- sum(good_results_filtered$match_return_good, na.rm = TRUE)
+  total_profit_good <- sum(good_results_filtered$profit_good, na.rm = TRUE)
+  
+  # Store results for this threshold
+  good_results_multinom <- rbind(
+    good_results_multinom, 
+    data.frame(threshold = good_thresh, total_return = total_return_good, total_profit = total_profit_good)
+  )
+}
+
+# Find the threshold with the highest total profit for the Good category
+optimal_good_threshold_multinom <- good_results_multinom[which.max(good_results_multinom$total_profit), ]
+
+# Print the results
+print(good_results_multinom)
+print(paste("Optimal Threshold for Good Category:", optimal_good_threshold_multinom$threshold))
+print(paste("Maximum Total Return for Good Category:", optimal_good_threshold_multinom$total_return))
+print(paste("Maximum Total Profit for Good Category:", optimal_good_threshold_multinom$total_profit))
+
+```
+
+```{r}
+total_return_multinom_good <- sum(good_multinom_results$match_return, na.rm = TRUE)
+average_return_multinom_good <- mean(good_multinom_results$match_return, na.rm = TRUE)
+total_profit_multinom_good <- sum(good_multinom_results$profit, na.rm = TRUE)
+average_profit_multinom_good <- mean(good_multinom_results$profit, na.rm = TRUE)
+print(paste("Total Return for Good Category:", total_return_multinom_good))
+print(paste("Average Return per Good Category Match:", average_return_multinom_good))
+print(paste("Total Profit for Good Category:", total_profit_multinom_good))
+print(paste("Average Profit per Good Category Match:", average_profit_multinom_good))
+```
+
+```{r}
+medium_multinom_results <- medium_test_data_filtered %>%
+  mutate(
+    predicted_result = medium_predictions_multinom,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+# Define a range of thresholds to test for the Medium category
+medium_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Medium category
+medium_results_multinom <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Medium category
+for (medium_thresh in medium_thresholds) {
+  medium_results_filtered <- medium_test_data_filtered %>%
+    mutate(
+      predicted_result_medium = medium_predictions_multinom,
+      predicted_prob_medium = case_when(
+        predicted_result_medium == 1 ~ pred_probs_medium_multinom[, "1"],  
+        predicted_result_medium == 2 ~ pred_probs_medium_multinom[, "2"],  
+        predicted_result_medium == 0 ~ pred_probs_medium_multinom[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  
+        predicted_result_medium == 1 & result == 1 ~ X1,  
+        predicted_result_medium == 2 & result == 2 ~ X2,  
+        predicted_result_medium == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  
+        match_return_medium > 0 ~ match_return_medium,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Medium category
+  total_return_medium <- sum(medium_results_filtered$match_return_medium, na.rm = TRUE)
+  total_profit_medium <- sum(medium_results_filtered$profit_medium, na.rm = TRUE)
+  
+  # Store results for this threshold
+  medium_results_multinom <- rbind(
+    medium_results_multinom, 
+    data.frame(threshold = medium_thresh, total_return = total_return_medium, total_profit = total_profit_medium)
+  )
+}
+
+# Find the threshold with the highest total profit for the Medium category
+optimal_medium_threshold_multinom <- medium_results_multinom[which.max(medium_results_multinom$total_profit), ]
+
+# Print the results
+print(medium_results_multinom)
+print(paste("Optimal Threshold for Medium Category:", optimal_medium_threshold_multinom$threshold))
+print(paste("Maximum Total Return for Medium Category:", optimal_medium_threshold_multinom$total_return))
+print(paste("Maximum Total Profit for Medium Category:", optimal_medium_threshold_multinom$total_profit))
+
+```
+```{r}
+# Calculate total and average return and profit for the Medium category
+total_return_multinom_medium <- sum(medium_multinom_results$match_return, na.rm = TRUE)
+average_return_multinom_medium <- mean(medium_multinom_results$match_return, na.rm = TRUE)
+total_profit_multinom_medium <- sum(medium_multinom_results$profit, na.rm = TRUE)
+average_profit_multinom_medium <- mean(medium_multinom_results$profit, na.rm = TRUE)
+
+# Print results for the Medium category
+print(paste("Total Return for Medium Category:", total_return_multinom_medium))
+print(paste("Average Return per Medium Category Match:", average_return_multinom_medium))
+print(paste("Total Profit for Medium Category:", total_profit_multinom_medium))
+print(paste("Average Profit per Medium Category Match:", average_profit_multinom_medium))
+
+```
+
+
+```{r}
+bad_multinom_results <- bad_test_data_filtered %>%
+  mutate(
+    predicted_result = bad_predictions_multinom,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+
+```
+
+```{r}
+# Define a range of thresholds to test for the Bad category
+bad_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Bad category
+bad_results_multinom <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Bad category
+for (bad_thresh in bad_thresholds) {
+  bad_results_filtered <- bad_test_data_filtered %>%
+    mutate(
+      predicted_result_bad = bad_predictions_multinom,  # Predictions from multinom model
+      predicted_prob_bad = case_when(
+        predicted_result_bad == 1 ~ pred_probs_bad_multinom[, "1"],  
+        predicted_result_bad == 2 ~ pred_probs_bad_multinom[, "2"],  
+        predicted_result_bad == 0 ~ pred_probs_bad_multinom[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        predicted_result_bad == 1 & result == 1 ~ X1,  
+        predicted_result_bad == 2 & result == 2 ~ X2,  
+        predicted_result_bad == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        match_return_bad > 0 ~ match_return_bad,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Bad category
+  total_return_bad <- sum(bad_results_filtered$match_return_bad, na.rm = TRUE)
+  total_profit_bad <- sum(bad_results_filtered$profit_bad, na.rm = TRUE)
+  
+  # Store results for this threshold
+  bad_results_multinom <- rbind(
+    bad_results_multinom, 
+    data.frame(threshold = bad_thresh, total_return = total_return_bad, total_profit = total_profit_bad)
+  )
+}
+
+# Find the threshold with the highest total profit for the Bad category
+optimal_bad_threshold_multinom <- bad_results_multinom[which.max(bad_results_multinom$total_profit), ]
+
+# Print the results
+print(bad_results_multinom)
+print(paste("Optimal Threshold for Bad Category:", optimal_bad_threshold_multinom$threshold))
+print(paste("Maximum Total Return for Bad Category:", optimal_bad_threshold_multinom$total_return))
+print(paste("Maximum Total Profit for Bad Category:", optimal_bad_threshold_multinom$total_profit))
+
+```
+
+```{r}
+total_return_multinom_bad <- sum(bad_multinom_results$match_return, na.rm = TRUE)
+average_return_multinom_bad <- mean(bad_multinom_results$match_return, na.rm = TRUE)
+total_profit_multinom_bad <- sum(bad_multinom_results$profit, na.rm = TRUE)
+average_profit_multinom_bad <- mean(bad_multinom_results$profit, na.rm = TRUE)
+print(paste("Total Return for Bad Category:", total_return_multinom_bad))
+print(paste("Average Return per Bad Category Match:", average_return_multinom_bad))
+print(paste("Total Profit for Bad Category:", total_profit_multinom_bad))
+print(paste("Average Profit per Bad Category Match:", average_profit_multinom_bad))
+```
+
+```{r}
+library(randomForest)
+rf_model <- randomForest(result ~ ., data = last_training_data,
+  mtry = 3,                                                    
+  ntree = 300,                                                
+  maxnodes = 10,                                               
+  importance = TRUE                                           
+)
+```
+
+
+```{r}
+good_predictions_rf <- predict(rf_model, newdata = good_test_data_filtered, type = "response")
+medium_predictions_rf <- predict(rf_model, newdata = medium_test_data_filtered, type = "response")
+bad_predictions_rf <- predict(rf_model, newdata = bad_test_data_filtered, type = "response")
+```
+
+```{r}
+pred_probs_good_rf <- predict(rf_model, newdata = good_test_data_filtered, type = "prob")
+pred_probs_medium_rf <- predict(rf_model, newdata = medium_test_data_filtered, type = "prob")
+pred_probs_bad_rf <- predict(rf_model, newdata = bad_test_data_filtered, type = "prob")
+```
+
+```{r}
+conf_matrix_good_rf <- confusionMatrix(good_predictions_rf, good_test_data_filtered$result)
+print(conf_matrix_good_rf)
+```
+
+```{r}
+conf_matrix_medium_rf <- confusionMatrix(medium_predictions_rf, medium_test_data_filtered$result)
+print(conf_matrix_medium_rf)
+```
+```{r}
+conf_matrix_bad_rf <- confusionMatrix(bad_predictions_rf, bad_test_data_filtered$result)
+print(conf_matrix_bad_rf)
+```
+
+```{r}
+good_rf_results <- good_test_data_filtered %>%
+  mutate(
+    predicted_result = good_predictions_rf,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+```{r}
+# Define a range of thresholds to test for the Good category
+good_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Good category
+good_results_rf <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Good category
+for (good_thresh in good_thresholds) {
+  good_results_filtered <- good_test_data_filtered %>%
+    mutate(
+      predicted_result_good = good_predictions_rf,  # Predictions from Random Forest model
+      predicted_prob_good = case_when(
+        predicted_result_good == 1 ~ pred_probs_good_rf[, "1"],  
+        predicted_result_good == 2 ~ pred_probs_good_rf[, "2"],  
+        predicted_result_good == 0 ~ pred_probs_good_rf[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        predicted_result_good == 1 & result == 1 ~ X1,  
+        predicted_result_good == 2 & result == 2 ~ X2,  
+        predicted_result_good == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        match_return_good > 0 ~ match_return_good,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Good category
+  total_return_good <- sum(good_results_filtered$match_return_good, na.rm = TRUE)
+  total_profit_good <- sum(good_results_filtered$profit_good, na.rm = TRUE)
+  
+  # Store results for this threshold
+  good_results_rf <- rbind(
+    good_results_rf, 
+    data.frame(threshold = good_thresh, total_return = total_return_good, total_profit = total_profit_good)
+  )
+}
+
+# Find the threshold with the highest total profit for the Good category
+optimal_good_threshold_rf <- good_results_rf[which.max(good_results_rf$total_profit), ]
+
+# Print the results
+print(good_results_rf)
+print(paste("Optimal Threshold for Good Category:", optimal_good_threshold_rf$threshold))
+print(paste("Maximum Total Return for Good Category:", optimal_good_threshold_rf$total_return))
+print(paste("Maximum Total Profit for Good Category:", optimal_good_threshold_rf$total_profit))
+
+```
+```{r}
+total_return_rf_good <- sum(good_rf_results$match_return, na.rm = TRUE)
+average_return_rf_good <- mean(good_rf_results$match_return, na.rm = TRUE)
+total_profit_rf_good <- sum(good_rf_results$profit, na.rm = TRUE)
+average_profit_rf_good <- mean(good_rf_results$profit, na.rm = TRUE)
+print(paste("Total Return for Good Category (RF):", total_return_rf_good))
+print(paste("Average Return per Good Category Match (RF):", average_return_rf_good))
+print(paste("Total Profit for Good Category (RF):", total_profit_rf_good))
+print(paste("Average Profit per Good Category Match (RF):", average_profit_rf_good))
+
+```
+
+```{r}
+medium_rf_results <- medium_test_data_filtered %>%
+  mutate(
+    predicted_result = medium_predictions_rf,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+
+```{r}
+# Define a range of thresholds to test for the Medium category
+medium_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Medium category
+medium_results_rf <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Medium category
+for (medium_thresh in medium_thresholds) {
+  medium_results_filtered <- medium_test_data_filtered %>%
+    mutate(
+      predicted_result_medium = medium_predictions_rf,  # Predictions from Random Forest model
+      predicted_prob_medium = case_when(
+        predicted_result_medium == 1 ~ pred_probs_medium_rf[, "1"],  
+        predicted_result_medium == 2 ~ pred_probs_medium_rf[, "2"],  
+        predicted_result_medium == 0 ~ pred_probs_medium_rf[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  # No bet if below threshold
+        predicted_result_medium == 1 & result == 1 ~ X1,  
+        predicted_result_medium == 2 & result == 2 ~ X2,  
+        predicted_result_medium == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  # No bet if below threshold
+        match_return_medium > 0 ~ match_return_medium,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Medium category
+  total_return_medium <- sum(medium_results_filtered$match_return_medium, na.rm = TRUE)
+  total_profit_medium <- sum(medium_results_filtered$profit_medium, na.rm = TRUE)
+  
+  # Store results for this threshold
+  medium_results_rf <- rbind(
+    medium_results_rf, 
+    data.frame(threshold = medium_thresh, total_return = total_return_medium, total_profit = total_profit_medium)
+  )
+}
+
+# Find the threshold with the highest total profit for the Medium category
+optimal_medium_threshold_rf <- medium_results_rf[which.max(medium_results_rf$total_profit), ]
+
+# Print the results
+print(medium_results_rf)
+print(paste("Optimal Threshold for Medium Category:", optimal_medium_threshold_rf$threshold))
+print(paste("Maximum Total Return for Medium Category:", optimal_medium_threshold_rf$total_return))
+print(paste("Maximum Total Profit for Medium Category:", optimal_medium_threshold_rf$total_profit))
+
+```
+```{r}
+# Calculate total and average return and profit for the Medium category
+total_return_rf_medium <- sum(medium_rf_results$match_return, na.rm = TRUE)
+average_return_rf_medium <- mean(medium_rf_results$match_return, na.rm = TRUE)
+total_profit_rf_medium <- sum(medium_rf_results$profit, na.rm = TRUE)
+average_profit_rf_medium <- mean(medium_rf_results$profit, na.rm = TRUE)
+
+# Print results for the Medium category
+print(paste("Total Return for Medium Category (RF):", total_return_rf_medium))
+print(paste("Average Return per Medium Category Match (RF):", average_return_rf_medium))
+print(paste("Total Profit for Medium Category (RF):", total_profit_rf_medium))
+print(paste("Average Profit per Medium Category Match (RF):", average_profit_rf_medium))
+
+```
+
+```{r}
+bad_rf_results <- bad_test_data_filtered %>%
+  mutate(
+    predicted_result = bad_predictions_rf,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+
+```{r}
+# Define a range of thresholds to test for the Bad category
+bad_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Bad category
+bad_results_rf <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Bad category
+for (bad_thresh in bad_thresholds) {
+  bad_results_filtered <- bad_test_data_filtered %>%
+    mutate(
+      predicted_result_bad = bad_predictions_rf,  # Predictions from Random Forest model
+      predicted_prob_bad = case_when(
+        predicted_result_bad == 1 ~ pred_probs_bad_rf[, "1"],  
+        predicted_result_bad == 2 ~ pred_probs_bad_rf[, "2"],  
+        predicted_result_bad == 0 ~ pred_probs_bad_rf[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        predicted_result_bad == 1 & result == 1 ~ X1,  
+        predicted_result_bad == 2 & result == 2 ~ X2,  
+        predicted_result_bad == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        match_return_bad > 0 ~ match_return_bad,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Bad category
+  total_return_bad <- sum(bad_results_filtered$match_return_bad, na.rm = TRUE)
+  total_profit_bad <- sum(bad_results_filtered$profit_bad, na.rm = TRUE)
+  
+  # Store results for this threshold
+  bad_results_rf <- rbind(
+    bad_results_rf, 
+    data.frame(threshold = bad_thresh, total_return = total_return_bad, total_profit = total_profit_bad)
+  )
+}
+
+# Find the threshold with the highest total profit for the Bad category
+optimal_bad_threshold_rf <- bad_results_rf[which.max(bad_results_rf$total_profit), ]
+
+# Print the results
+print(bad_results_rf)
+print(paste("Optimal Threshold for Bad Category:", optimal_bad_threshold_rf$threshold))
+print(paste("Maximum Total Return for Bad Category:", optimal_bad_threshold_rf$total_return))
+print(paste("Maximum Total Profit for Bad Category:", optimal_bad_threshold_rf$total_profit))
+
+```
+```{r}
+# Calculate total and average return and profit for the Bad category
+total_return_rf_bad <- sum(bad_rf_results$match_return, na.rm = TRUE)
+average_return_rf_bad <- mean(bad_rf_results$match_return, na.rm = TRUE)
+total_profit_rf_bad <- sum(bad_rf_results$profit, na.rm = TRUE)
+average_profit_rf_bad <- mean(bad_rf_results$profit, na.rm = TRUE)
+
+# Print results for the Bad category
+print(paste("Total Return for Bad Category (RF):", total_return_rf_bad))
+print(paste("Average Return per Bad Category Match (RF):", average_return_rf_bad))
+print(paste("Total Profit for Bad Category (RF):", total_profit_rf_bad))
+print(paste("Average Profit per Bad Category Match (RF):", average_profit_rf_bad))
+
+```
+```{r}
+good_test_target <- as.numeric(as.character(good_test_data_filtered$result))
+good_test_features <- good_test_data_filtered[, !names(good_test_data_filtered) %in% "result"]
+good_test_features <- good_test_features[, !names(good_test_features) %in% "category"]
+good_test_matrix <- xgb.DMatrix(data = as.matrix(good_test_features), label = good_test_target)
+medium_test_target <- as.numeric(as.character(medium_test_data_filtered$result))
+medium_test_features <- medium_test_data_filtered[, !names(medium_test_data_filtered) %in% "result"]
+medium_test_features <- medium_test_features[, !names(medium_test_features) %in% "category"]
+medium_test_matrix <- xgb.DMatrix(data = as.matrix(medium_test_features), label = medium_test_target)
+bad_test_target <- as.numeric(as.character(bad_test_data_filtered$result))
+bad_test_features <- bad_test_data_filtered[, !names(bad_test_data_filtered) %in% "result"]
+bad_test_features <- bad_test_features[, !names(bad_test_features) %in% "category"]
+bad_test_matrix <- xgb.DMatrix(data = as.matrix(bad_test_features), label = bad_test_target)
+
+```
+
+
+```{r}
+params2 <- list(
+  objective = "multi:softprob",  
+  num_class = 3, 
+  eval_metric = "merror",
+  eta = 0.05, 
+  max_depth = 3,
+  nthread = 2
+)
+
+num_round <- 100
+
+model_good_prob <- xgb.train(
+  params = params2,
+  data = good_matrix,
+  nrounds = num_round
+)
+model_medium_prob <- xgb.train(
+  params = params2,
+  data = medium_matrix,
+  nrounds = num_round
+)
+model_bad_prob <- xgb.train(
+  params = params2,
+  data = bad_matrix,
+  nrounds = num_round
+)
+```
+
+```{r}
+good_predictions_xg <- predict(model_good, newdata = good_test_matrix)
+medium_predictions_xg <- predict(model_medium, newdata = medium_test_matrix)
+bad_predictions_xg <- predict(model_bad, newdata = bad_test_matrix)
+```
+
+```{r}
+pred_probs_good_xg <- predict(model_good_prob, newdata = good_test_matrix, type = "prob")
+pred_probs_medium_xg <- predict(model_medium_prob, newdata = medium_test_matrix, type = "prob")
+pred_probs_bad_xg <- predict(model_bad_prob, newdata = bad_test_matrix, type = "prob")
+```
+
+```{r}
+pred_probs_good_xg <- matrix(pred_probs_good_xg, ncol = 3, byrow = TRUE)
+colnames(pred_probs_good_xg) <- c("0", "1", "2")
+pred_probs_bad_xg <- matrix(pred_probs_bad_xg, ncol = 3, byrow = TRUE)
+colnames(pred_probs_bad_xg) <- c("0", "1", "2")
+pred_probs_medium_xg <- matrix(pred_probs_medium_xg, ncol = 3, byrow = TRUE)
+colnames(pred_probs_medium_xg) <- c("0", "1", "2")
+```
+
+```{r}
+good_test_matrix <- xgb.DMatrix(data = as.matrix(good_test_features))
+
+preds_good_test <- predict(model_good, good_test_matrix)
+
+conf_matrix_good_test <- confusionMatrix(
+  as.factor(preds_good_test),
+  as.factor(good_test_target)
+)
+
+cat("\n-- Good Category TEST --\n")
+print(conf_matrix_good_test)
+```
+
+
+```{r}
+conf_matrix_good_xg <- confusionMatrix(as.factor(good_predictions_xg), as.factor(good_test_data_filtered$result))
+print(conf_matrix_good_xg)
+conf_matrix_medium_xg <- confusionMatrix(as.factor(medium_predictions_xg), as.factor(medium_test_data_filtered$result))
+print(conf_matrix_medium_xg)
+conf_matrix_bad_xg <- confusionMatrix(as.factor(bad_predictions_xg), as.factor(bad_test_data_filtered$result))
+print(conf_matrix_bad_xg)
+```
+
+
+
+```{r}
+good_xg_results <- good_test_data_filtered %>%
+  mutate(
+    predicted_result = good_predictions_xg,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+```{r}
+# Define a range of thresholds to test for the Good category
+good_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Good category
+good_results_xg <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Good category
+for (good_thresh in good_thresholds) {
+  good_results_filtered <- good_test_data_filtered %>%
+    mutate(
+      predicted_result_good = good_predictions_xg,
+      predicted_prob_good = case_when(
+        predicted_result_good == 1 ~ pred_probs_good_xg[, "1"],  
+        predicted_result_good == 2 ~ pred_probs_good_xg[, "2"],  
+        predicted_result_good == 0 ~ pred_probs_good_xg[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        predicted_result_good == 1 & result == 1 ~ X1,  
+        predicted_result_good == 2 & result == 2 ~ X2,  
+        predicted_result_good == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_good = case_when(
+        predicted_prob_good < good_thresh ~ 0,  # No bet if below threshold
+        match_return_good > 0 ~ match_return_good,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Good category
+  total_return_good <- sum(good_results_filtered$match_return_good, na.rm = TRUE)
+  total_profit_good <- sum(good_results_filtered$profit_good, na.rm = TRUE)
+  
+  # Store results for this threshold
+  good_results_xg <- rbind(
+    good_results_xg, 
+    data.frame(threshold = good_thresh, total_return = total_return_good, total_profit = total_profit_good)
+  )
+}
+
+# Find the threshold with the highest total profit for the Good category
+optimal_good_threshold_xg <- good_results_xg[which.max(good_results_xg$total_profit), ]
+
+# Print the results
+print(good_results_xg)
+print(paste("Optimal Threshold for Good Category (XGBoost):", optimal_good_threshold_xg$threshold))
+print(paste("Maximum Total Return for Good Category (XGBoost):", optimal_good_threshold_xg$total_return))
+print(paste("Maximum Total Profit for Good Category (XGBoost):", optimal_good_threshold_xg$total_profit))
+
+```
+```{r}
+
+total_return_xg_good <- sum(good_xg_results$match_return, na.rm = TRUE)
+average_return_xg_good <- mean(good_xg_results$match_return, na.rm = TRUE)
+total_profit_xg_good <- sum(good_xg_results$profit, na.rm = TRUE)
+average_profit_xg_good <- mean(good_xg_results$profit, na.rm = TRUE)
+
+print(paste("Total Return for Good Category (XG):", total_return_xg_good))
+print(paste("Average Return per Good Category Match (XG):", average_return_xg_good))
+print(paste("Total Profit for Good Category (XG):", total_profit_xg_good))
+print(paste("Average Profit per Good Category Match (XG):", average_profit_xg_good))
+
+```
+
+
+```{r}
+medium_xg_results <- medium_test_data_filtered %>%
+  mutate(
+    predicted_result = medium_predictions_xg,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+```{r}
+# Define a range of thresholds to test for the Medium category
+medium_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Medium category
+medium_results_xg <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Medium category
+for (medium_thresh in medium_thresholds) {
+  medium_results_filtered <- medium_test_data_filtered %>%
+    mutate(
+      predicted_result_medium = medium_predictions_xg,
+      predicted_prob_medium = case_when(
+        predicted_result_medium == 1 ~ pred_probs_medium_xg[, "1"],  
+        predicted_result_medium == 2 ~ pred_probs_medium_xg[, "2"],  
+        predicted_result_medium == 0 ~ pred_probs_medium_xg[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  # No bet if below threshold
+        predicted_result_medium == 1 & result == 1 ~ X1,  
+        predicted_result_medium == 2 & result == 2 ~ X2,  
+        predicted_result_medium == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_medium = case_when(
+        predicted_prob_medium < medium_thresh ~ 0,  # No bet if below threshold
+        match_return_medium > 0 ~ match_return_medium,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Medium category
+  total_return_medium <- sum(medium_results_filtered$match_return_medium, na.rm = TRUE)
+  total_profit_medium <- sum(medium_results_filtered$profit_medium, na.rm = TRUE)
+  
+  # Store results for this threshold
+  medium_results_xg <- rbind(
+    medium_results_xg, 
+    data.frame(threshold = medium_thresh, total_return = total_return_medium, total_profit = total_profit_medium)
+  )
+}
+
+# Find the threshold with the highest total profit for the Medium category
+optimal_medium_threshold_xg <- medium_results_xg[which.max(medium_results_xg$total_profit), ]
+
+# Print the results
+print(medium_results_xg)
+print(paste("Optimal Threshold for Medium Category (XGBoost):", optimal_medium_threshold_xg$threshold))
+print(paste("Maximum Total Return for Medium Category (XGBoost):", optimal_medium_threshold_xg$total_return))
+print(paste("Maximum Total Profit for Medium Category (XGBoost):", optimal_medium_threshold_xg$total_profit))
+
+```
+```{r}
+# Calculate total and average return and profit for the Medium category
+total_return_xg_medium <- sum(medium_xg_results$match_return, na.rm = TRUE)
+average_return_xg_medium <- mean(medium_xg_results$match_return, na.rm = TRUE)
+total_profit_xg_medium <- sum(medium_xg_results$profit, na.rm = TRUE)
+average_profit_xg_medium <- mean(medium_xg_results$profit, na.rm = TRUE)
+
+# Print results for the Medium category
+print(paste("Total Return for Medium Category (XG):", total_return_xg_medium))
+print(paste("Average Return per Medium Category Match (XG):", average_return_xg_medium))
+print(paste("Total Profit for Medium Category (XG):", total_profit_xg_medium))
+print(paste("Average Profit per Medium Category Match (XG):", average_profit_xg_medium))
+
+```
+
+```{r}
+bad_xg_results <- bad_test_data_filtered %>%
+  mutate(
+    predicted_result = bad_predictions_xg,
+    match_return = case_when(
+      predicted_result == 1 & result == 1 ~ X1,  
+      predicted_result == 2 & result == 2 ~ X2,  
+      predicted_result == 0 & result == 0 ~ X,
+      TRUE ~ 0
+    ),
+    profit = case_when(
+    match_return > 0 ~ match_return,  
+    TRUE ~ -1                        
+    )
+  )
+```
+
+```{r}
+# Define a range of thresholds to test for the Bad category
+bad_thresholds <- seq(0.50, 0.90, by = 0.01)
+
+# Initialize an empty data frame to store results for the Bad category
+bad_results_xg <- data.frame(threshold = numeric(), total_return = numeric(), total_profit = numeric())
+
+# Loop over each threshold and calculate return and profit for the Bad category
+for (bad_thresh in bad_thresholds) {
+  bad_results_filtered <- bad_test_data_filtered %>%
+    mutate(
+      predicted_result_bad = bad_predictions_xg,
+      predicted_prob_bad = case_when(
+        predicted_result_bad == 1 ~ pred_probs_bad_xg[, "1"],  
+        predicted_result_bad == 2 ~ pred_probs_bad_xg[, "2"],  
+        predicted_result_bad == 0 ~ pred_probs_bad_xg[, "0"],  
+        TRUE ~ NA_real_                                    
+      ),
+      match_return_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        predicted_result_bad == 1 & result == 1 ~ X1,  
+        predicted_result_bad == 2 & result == 2 ~ X2,  
+        predicted_result_bad == 0 & result == 0 ~ X,
+        TRUE ~ 0  
+      ),
+      profit_bad = case_when(
+        predicted_prob_bad < bad_thresh ~ 0,  # No bet if below threshold
+        match_return_bad > 0 ~ match_return_bad,  
+        TRUE ~ -1
+      )
+    )
+  
+  # Calculate total return and profit for the Bad category
+  total_return_bad <- sum(bad_results_filtered$match_return_bad, na.rm = TRUE)
+  total_profit_bad <- sum(bad_results_filtered$profit_bad, na.rm = TRUE)
+  
+  # Store results for this threshold
+  bad_results_xg <- rbind(
+    bad_results_xg, 
+    data.frame(threshold = bad_thresh, total_return = total_return_bad, total_profit = total_profit_bad)
+  )
+}
+
+# Find the threshold with the highest total profit for the Bad category
+optimal_bad_threshold_xg <- bad_results_xg[which.max(bad_results_xg$total_profit), ]
+
+# Print the results
+print(bad_results_xg)
+print(paste("Optimal Threshold for Bad Category (XGBoost):", optimal_bad_threshold_xg$threshold))
+print(paste("Maximum Total Return for Bad Category (XGBoost):", optimal_bad_threshold_xg$total_return))
+print(paste("Maximum Total Profit for Bad Category (XGBoost):", optimal_bad_threshold_xg$total_profit))
+
+```
+```{r}
+# Calculate total and average return and profit for the Bad category
+total_return_xg_bad <- sum(bad_xg_results$match_return, na.rm = TRUE)
+average_return_xg_bad <- mean(bad_xg_results$match_return, na.rm = TRUE)
+total_profit_xg_bad <- sum(bad_xg_results$profit, na.rm = TRUE)
+average_profit_xg_bad <- mean(bad_xg_results$profit, na.rm = TRUE)
+
+# Print results for the Bad category
+print(paste("Total Return for Bad Category (XG):", total_return_xg_bad))
+print(paste("Average Return per Bad Category Match (XG):", average_return_xg_bad))
+print(paste("Total Profit for Bad Category (XG):", total_profit_xg_bad))
+print(paste("Average Profit per Bad Category Match (XG):", average_profit_xg_bad))
+
+```
+
+
